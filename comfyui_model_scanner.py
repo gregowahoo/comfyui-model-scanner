@@ -39,6 +39,7 @@ def log_exc(context: str):
 # ── Configuration ──────────────────────────────────────────────────────────────
 MODEL_ROOTS = [
     r"C:\ComfyUI.Data\models",
+    r"C:\ComfyUI_windows_portable\ComfyUI\models",
     r"F:\ComfyUI.stuff\models",
 ]
 
@@ -148,13 +149,27 @@ def search_model_online(filename: str) -> list[dict]:
                 })
 
     # ── CivitAI: search by filename stem ──────────────────────────────────────
+    # Only show results where the model name shares meaningful words with our stem
+    stem_words = set(stem.lower().replace("-", " ").replace("_", " ").split())
+    # Filter out very common noise words
+    noise = {"model", "the", "and", "for", "with", "lora", "v1", "v2", "v3",
+             "fp8", "fp16", "bf16", "safetensors", "ckpt"}
+    stem_words -= noise
+
     q2   = urllib.parse.quote(stem.replace("-", " ").replace("_", " "))
-    cdata = _civitai_api(f"https://civitai.com/api/v1/models?query={q2}&limit=5")
+    cdata = _civitai_api(f"https://civitai.com/api/v1/models?query={q2}&limit=10")
     if cdata:
-        for model in cdata.get("items", [])[:5]:
+        for model in cdata.get("items", [])[:10]:
             name     = model.get("name", "")
             model_id = model.get("id")
             page     = f"https://civitai.com/models/{model_id}" if model_id else None
+
+            # Score: how many stem words appear in the model name?
+            name_lower  = name.lower()
+            match_count = sum(1 for w in stem_words if w in name_lower)
+            if not stem_words or match_count == 0:
+                continue  # skip if zero overlap
+
             # Try to find a version file that matches
             dl_url = None
             for ver in model.get("modelVersions", [])[:3]:
@@ -170,8 +185,15 @@ def search_model_online(filename: str) -> list[dict]:
                     "name":         name,
                     "url":          page,
                     "download_url": dl_url,
-                    "info":         "exact file match" if dl_url else "possible match",
+                    "info":         "exact file match" if dl_url else f"possible match ({match_count} keywords)",
+                    "_score":       match_count + (10 if dl_url else 0),
                 })
+
+    # Sort CivitAI results by score (exact matches first, then keyword overlap)
+    civ = [r for r in results if r.get("source") == "CivitAI"]
+    hf  = [r for r in results if r.get("source") == "HuggingFace"]
+    civ.sort(key=lambda r: r.get("_score", 0), reverse=True)
+    results = hf + civ[:5]   # cap CivitAI at 5 after filtering
 
     log.info(f"Search '{filename}': {len(results)} result(s)")
     return results
@@ -252,10 +274,11 @@ def extract_models_from_workflow(workflow: dict) -> list[dict]:
         is_ext   = ext in MODEL_EXTENSIONS
         if not (is_known or (CATCH_BY_EXTENSION and is_ext)):
             return
-        key = (field, value)
-        if key in seen:
+        # Deduplicate by filename — different paths/fields pointing to same file = one entry
+        fname_key = Path(value).name.lower()
+        if fname_key in seen:
             return
-        seen.add(key)
+        seen.add(fname_key)
         entry = {
             "field":     field,
             "value":     value,
@@ -274,18 +297,48 @@ def extract_models_from_workflow(workflow: dict) -> list[dict]:
                 continue
             nid  = node.get("id", "?")
             ntyp = node.get("type", "Unknown")
+
+            # ── inputs array (UI format) ───────────────────────────────────────
             for inp in node.get("inputs", []):
-                val = inp.get("widget", {})
-                if isinstance(val, dict):
-                    record(inp.get("name", ""), val.get("value", ""), nid, ntyp, source)
+                if not isinstance(inp, dict):
+                    continue
+                fname = inp.get("name", "")
+                # Direct value on the input
+                for vkey in ("value", "widget_value", "default"):
+                    v = inp.get(vkey)
+                    if isinstance(v, str):
+                        record(fname, v, nid, ntyp, source)
+                # Nested widget dict
+                widget = inp.get("widget")
+                if isinstance(widget, dict):
+                    v = widget.get("value", "")
+                    if isinstance(v, str):
+                        record(fname, v, nid, ntyp, source)
+
+            # ── widgets_values list ────────────────────────────────────────────
             for wv in node.get("widgets_values", []):
                 if isinstance(wv, str) and Path(wv).suffix.lower() in MODEL_EXTENSIONS:
                     record("widgets_values", wv, nid, ntyp, source)
+                elif isinstance(wv, dict):
+                    # Some nodes embed dicts inside widgets_values
+                    for k, v in wv.items():
+                        if isinstance(v, str) and Path(v).suffix.lower() in MODEL_EXTENSIONS:
+                            record(k, v, nid, ntyp, source)
+
+            # ── properties.models list ────────────────────────────────────────
             for m in node.get("properties", {}).get("models", []):
                 if isinstance(m, dict):
                     name = m.get("name", "")
                     if name and Path(name).suffix.lower() in MODEL_EXTENSIONS:
                         record("properties.models", name, nid, ntyp, source)
+
+            # ── node_data / extra catch-all ───────────────────────────────────
+            for container_key in ("node_data", "extra", "data"):
+                container = node.get(container_key)
+                if isinstance(container, dict):
+                    for k, v in container.items():
+                        if isinstance(v, str) and Path(v).suffix.lower() in MODEL_EXTENSIONS:
+                            record(k, v, nid, ntyp, f"{source}:{container_key}")
 
     log.debug(f"Workflow keys: {list(workflow.keys())[:10]}")
 
@@ -298,21 +351,47 @@ def extract_models_from_workflow(workflow: dict) -> list[dict]:
     elif "nodes" in workflow:
         log.info("Format: UI")
         scan_nodes(workflow["nodes"], "top-level")
-        subgraphs = workflow.get("definitions", {}).get("subgraphs", [])
-        log.info(f"{len(subgraphs)} subgraph(s)")
-        for sg in subgraphs:
-            if isinstance(sg, dict):
-                sg_name = sg.get("name", sg.get("id", "?"))
-                scan_nodes(sg.get("nodes", []), f"subgraph:{sg_name}")
-    else:
-        log.warning("Unknown format — deep scan")
-        def deep(obj):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    record(k, v, "?", "?", "deep") if isinstance(v, str) else deep(v)
-            elif isinstance(obj, list):
-                [deep(i) for i in obj]
-        deep(workflow)
+
+        # Subgraphs — check multiple known locations
+        for sg_container in [
+            workflow.get("definitions", {}).get("subgraphs", []),
+            workflow.get("extra", {}).get("subgraphs", []),
+            workflow.get("subgraphs", []),
+        ]:
+            if not sg_container:
+                continue
+            log.info(f"{len(sg_container)} subgraph(s) in container")
+            for sg in sg_container:
+                if isinstance(sg, dict):
+                    sg_name = sg.get("name", sg.get("id", "?"))
+                    scan_nodes(sg.get("nodes", []), f"subgraph:{sg_name}")
+                    # Some subgraphs have nested subgraphs
+                    for nested in sg.get("subgraphs", []):
+                        if isinstance(nested, dict):
+                            n_name = nested.get("name", nested.get("id", "?"))
+                            scan_nodes(nested.get("nodes", []), f"subgraph:{sg_name}/{n_name}")
+
+    # ── Always run deep scan as a supplement to catch anything missed ──────────
+    pre_count = len(found)
+    def deep(obj, depth=0):
+        if depth > 12:   # guard against pathological nesting
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str):
+                    record(k, v, "deep", "deep", "deep-scan")
+                else:
+                    deep(v, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, str):
+                    record("widgets_values", item, "deep", "deep", "deep-scan")
+                else:
+                    deep(item, depth + 1)
+    deep(workflow)
+    extra = len(found) - pre_count
+    if extra:
+        log.info(f"Deep scan found {extra} additional model ref(s)")
 
     log.info(f"Extraction: {len(found)} model ref(s)")
     return found
@@ -451,6 +530,8 @@ class App(tk.Tk):
         ttk.Button(ctrl, text="🔍  Re-scan Drives",     command=self._scan_drives  ).pack(side="left", padx=(8, 0))
         ttk.Button(ctrl, text="📋  Copy Path",          command=self._copy_path    ).pack(side="left", padx=(8, 0))
         ttk.Button(ctrl, text="📄  Open Log",           command=self._open_log     ).pack(side="left", padx=(8, 0))
+        ttk.Button(ctrl, text="📦  Copy F:→C:",        command=self._copy_to_c    ).pack(side="left", padx=(8, 0))
+        ttk.Button(ctrl, text="⚙  Manage Roots",       command=self._manage_roots ).pack(side="left", padx=(8, 0))
         ttk.Label( ctrl, textvariable=self.workflow_var, style="Dim.TLabel").pack(side="left", padx=(16, 0))
 
         # Legend
@@ -1001,7 +1082,320 @@ class App(tk.Tk):
             pass
 
 
-# ── Global exception hook ─────────────────────────────────────────────────────
+    # ── Manage scan roots ──────────────────────────────────────────────────────
+    def _manage_roots(self):
+        ManageRootsDialog(self, on_save=self._roots_saved)
+
+    def _roots_saved(self):
+        self.status_var.set("Scan roots updated. Re-scan to apply.")
+
+
+    def _copy_to_c(self):
+        if not self.results:
+            messagebox.showinfo("No Workflow", "Load a workflow first.")
+            return
+
+        F_ROOT = r"F:\ComfyUI.stuff\models"
+        C_ROOT = r"C:\ComfyUI.Data\models"
+
+        # Build list of (src_path, dst_path, size) for files on F: with no C: copy
+        queue = []
+        for r in self.results:
+            if not r["found"]:
+                continue
+            locs = r.get("locations", [])
+            has_c = any(e["path"].upper().startswith("C:") for e in locs)
+            if has_c:
+                continue
+            f_copies = [e for e in locs if e["path"].upper().startswith("F:")]
+            if not f_copies:
+                continue
+            src = f_copies[0]["path"]
+            # Map F:\ComfyUI.stuff\models\... → C:\ComfyUI.Data\models\...
+            src_norm = src.upper()
+            f_root_norm = F_ROOT.upper()
+            if src_norm.startswith(f_root_norm):
+                rel = src[len(F_ROOT):]
+                dst = C_ROOT + rel
+            else:
+                # F: path doesn't match expected root — mirror at subfolder level
+                rel = os.path.relpath(src, "F:\\ComfyUI.stuff\\models")
+                dst = os.path.join(C_ROOT, rel)
+            queue.append({"src": src, "dst": dst, "size": f_copies[0]["size"],
+                           "filename": r["filename"]})
+
+        if not queue:
+            messagebox.showinfo("Nothing to Copy",
+                "All found models already have a C: copy, or no F: copies were found.")
+            return
+
+        total_bytes = sum(q["size"] for q in queue)
+        msg = (f"{len(queue)} file(s) to copy to C:\n"
+               f"Total size: {fmt_size(total_bytes)}\n\n"
+               f"Destination root:\n  {C_ROOT}\n\nProceed?")
+        if not messagebox.askyesno("Copy F: → C:", msg):
+            return
+
+        CopyProgressDialog(self, queue, C_ROOT, on_done=self._scan_drives)
+
+
+# ── Manage Roots dialog ───────────────────────────────────────────────────────
+
+class ManageRootsDialog(tk.Toplevel):
+    def __init__(self, parent, on_save=None):
+        super().__init__(parent)
+        self.title("Manage Scan Roots")
+        self.configure(bg=BG)
+        self.geometry("620x380")
+        self.resizable(True, True)
+        self.grab_set()
+        self._on_save = on_save
+        self._build_ui()
+
+    def _build_ui(self):
+        tk.Label(self, text="Model scan roots  —  all subfolders are indexed",
+                 bg=BG, fg=LIME, font=("Consolas", 11, "bold")).pack(fill="x", padx=16, pady=(12, 4))
+        tk.Label(self, text="Paths that don't exist are skipped automatically.",
+                 bg=BG, fg=DIM, font=("Consolas", 9)).pack(fill="x", padx=16, pady=(0, 8))
+
+        list_frame = tk.Frame(self, bg=BG)
+        list_frame.pack(fill="both", expand=True, padx=16)
+
+        self.listbox = tk.Listbox(
+            list_frame, bg="#0f1a2e", fg=TEXT, selectbackground=ACCENT,
+            font=("Consolas", 10), relief="flat", height=8,
+            selectforeground="#fff"
+        )
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=vsb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        for root in MODEL_ROOTS:
+            self._add_item(root)
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(fill="x", padx=16, pady=8)
+
+        ttk.Button(btn_row, text="➕  Add Folder",   command=self._add   ).pack(side="left")
+        ttk.Button(btn_row, text="✖  Remove",        command=self._remove ).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="✔  Save & Close",  command=self._save   ).pack(side="right")
+        ttk.Button(btn_row, text="Cancel",            command=self.destroy ).pack(side="right", padx=(0, 8))
+
+        # Status
+        self.status_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self.status_var,
+                 bg=BG, fg=AMBER, font=("Consolas", 9)).pack(fill="x", padx=16, pady=(0, 8))
+
+    def _add_item(self, path):
+        exists = os.path.isdir(path)
+        label  = f"{'✔' if exists else '✘'}  {path}"
+        self.listbox.insert("end", label)
+        self.listbox.itemconfig("end", fg=LIME if exists else RED)
+
+    def _add(self):
+        path = filedialog.askdirectory(title="Select model root folder")
+        if path:
+            # Normalize to Windows path
+            path = str(Path(path))
+            if path not in MODEL_ROOTS:
+                MODEL_ROOTS.append(path)
+                self._add_item(path)
+                log.info(f"Root added: {path}")
+            else:
+                self.status_var.set("That path is already in the list.")
+
+    def _remove(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            self.status_var.set("Select a path first.")
+            return
+        idx = sel[0]
+        if len(MODEL_ROOTS) <= 1:
+            self.status_var.set("Cannot remove the last root.")
+            return
+        removed = MODEL_ROOTS.pop(idx)
+        self.listbox.delete(idx)
+        log.info(f"Root removed: {removed}")
+        self.status_var.set(f"Removed: {removed}")
+
+    def _save(self):
+        if self._on_save:
+            self._on_save()
+        self.destroy()
+
+
+
+
+class CopyProgressDialog(tk.Toplevel):
+    CHUNK = 8 * 1024 * 1024  # 8 MB chunks — fast on NVMe
+
+    def __init__(self, parent, queue: list, c_root: str, on_done=None):
+        super().__init__(parent)
+        self.title("Copy F: → C:")
+        self.configure(bg=BG)
+        self.resizable(True, False)
+        self.geometry("660x320")
+        self.grab_set()
+
+        self._queue    = queue
+        self._c_root   = c_root
+        self._on_done  = on_done
+        self._cancel   = False
+        self._done     = False
+
+        self._build_ui(len(queue), sum(q["size"] for q in queue))
+        self.after(100, self._start)
+
+    def _build_ui(self, n_files: int, total_bytes: int):
+        pad = dict(padx=16, pady=6)
+
+        # Title
+        tk.Label(self, text=f"Copying {n_files} file(s)  —  {fmt_size(total_bytes)} total",
+                 bg=BG, fg=LIME, font=("Consolas", 11, "bold")).pack(fill="x", **pad)
+
+        # Current file label
+        self._file_var = tk.StringVar(value="Starting…")
+        tk.Label(self, textvariable=self._file_var,
+                 bg=BG, fg=TEXT, font=("Consolas", 10),
+                 anchor="w", wraplength=620).pack(fill="x", padx=16)
+
+        # Per-file progress bar
+        tk.Label(self, text="File progress:", bg=BG, fg=DIM,
+                 font=("Consolas", 9), anchor="w").pack(fill="x", padx=16)
+        self._file_pb = ttk.Progressbar(self, mode="determinate", style="TProgressbar")
+        self._file_pb.pack(fill="x", padx=16, pady=(0, 6))
+
+        # Overall progress bar
+        tk.Label(self, text="Overall:", bg=BG, fg=DIM,
+                 font=("Consolas", 9), anchor="w").pack(fill="x", padx=16)
+        self._overall_pb = ttk.Progressbar(self, mode="determinate",
+                                            maximum=max(total_bytes, 1),
+                                            style="TProgressbar")
+        self._overall_pb.pack(fill="x", padx=16, pady=(0, 6))
+
+        # Stats line: speed / ETA / files done
+        self._stats_var = tk.StringVar(value="")
+        tk.Label(self, textvariable=self._stats_var,
+                 bg=BG, fg=AMBER, font=("Consolas", 10)).pack(fill="x", **pad)
+
+        # Buttons
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(fill="x", padx=16, pady=8)
+        self._cancel_btn = ttk.Button(btn_row, text="✖  Cancel", command=self._on_cancel)
+        self._cancel_btn.pack(side="right")
+        self._close_btn  = ttk.Button(btn_row, text="✔  Close",  command=self.destroy,
+                                      state="disabled")
+        self._close_btn.pack(side="right", padx=(0, 8))
+
+        self._total_bytes  = max(sum(q["size"] for q in self._queue), 1)
+        self._copied_total = 0
+        self._t_start      = None
+
+    def _start(self):
+        import threading
+        self._t_start = __import__("time").time()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        import time, shutil
+        queue  = self._queue
+        n      = len(queue)
+
+        for idx, item in enumerate(queue):
+            if self._cancel:
+                break
+
+            src      = item["src"]
+            dst      = item["dst"]
+            filename = item["filename"]
+            filesize = max(item["size"], 1)
+
+            self.after(0, lambda fn=filename, i=idx: self._file_var.set(
+                f"[{i+1}/{n}]  {fn}  ({fmt_size(filesize)})\n→ {dst}"))
+            self.after(0, lambda: self._file_pb.configure(value=0, maximum=max(filesize, 1)))
+
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                file_copied = 0
+                with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                    while True:
+                        if self._cancel:
+                            break
+                        chunk = fsrc.read(self.CHUNK)
+                        if not chunk:
+                            break
+                        fdst.write(chunk)
+                        file_copied        += len(chunk)
+                        self._copied_total += len(chunk)
+
+                        # Update UI every chunk
+                        fc = file_copied
+                        tc = self._copied_total
+                        elapsed = max(time.time() - self._t_start, 0.001)
+                        speed   = tc / elapsed          # bytes/sec
+                        remain  = self._total_bytes - tc
+                        eta_s   = int(remain / speed) if speed > 0 else 0
+                        eta_str = (f"{eta_s//60}m {eta_s%60:02d}s" if eta_s >= 60
+                                   else f"{eta_s}s")
+
+                        self.after(0, lambda fp=fc, tp=tc, sp=speed, e=eta_str, i=idx: (
+                            self._file_pb.configure(value=fp),
+                            self._overall_pb.configure(value=tp),
+                            self._stats_var.set(
+                                f"Speed: {fmt_size(int(sp))}/s    "
+                                f"ETA: {e}    "
+                                f"Files: {i+1}/{n}    "
+                                f"Copied: {fmt_size(tp)} / {fmt_size(self._total_bytes)}"
+                            )
+                        ))
+
+                if self._cancel and file_copied < filesize:
+                    # Remove incomplete file
+                    try: os.remove(dst)
+                    except Exception: pass
+                else:
+                    try: shutil.copystat(src, dst)
+                    except Exception: pass
+
+            except Exception as e:
+                log.error(f"Copy failed: {src} → {dst}: {e}")
+                self.after(0, lambda err=str(e), fn=filename: messagebox.showerror(
+                    "Copy Error", f"Failed copying {fn}:\n{err}"))
+
+        # Done
+        self.after(0, self._finish)
+
+    def _finish(self):
+        if self._cancel:
+            self._stats_var.set("Cancelled.")
+        else:
+            elapsed = __import__("time").time() - self._t_start
+            avg     = self._copied_total / max(elapsed, 0.001)
+            self._stats_var.set(
+                f"✔ Done — {fmt_size(self._copied_total)} copied "
+                f"in {elapsed:.1f}s  (avg {fmt_size(int(avg))}/s)"
+            )
+            self._file_var.set("All files copied successfully.")
+            self._file_pb.configure(value=self._file_pb["maximum"])
+            self._overall_pb.configure(value=self._total_bytes)
+
+        self._cancel_btn.configure(state="disabled")
+        self._close_btn.configure(state="normal")
+        self._done = True
+        log.info("Copy operation complete.")
+
+        if not self._cancel and self._on_done:
+            # Trigger a re-scan after a short delay
+            self.after(800, self._on_done)
+
+    def _on_cancel(self):
+        self._cancel = True
+        self._cancel_btn.configure(state="disabled")
+        self._stats_var.set("Cancelling…")
+
+
+
 def _exc_hook(t, v, tb):
     log.critical("Unhandled:\n" + "".join(traceback.format_exception(t, v, tb)))
     try:
