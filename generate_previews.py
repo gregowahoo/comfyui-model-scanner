@@ -10,10 +10,15 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+# Force UTF-8 output so filenames with special characters don't crash on Windows consoles
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -196,15 +201,17 @@ def render_detailed(json_path: Path) -> "Image.Image | None":
     except Exception:
         return None
 
-    if not isinstance(data, dict) or "nodes" not in data:
+    if not isinstance(data, dict):
         return None
 
-    nodes:  list[dict] = data.get("nodes",  [])
-    links:  list[list] = data.get("links",  [])
-    groups: list[dict] = data.get("groups", [])
+    nodes  = data.get("nodes",  [])
+    links  = data.get("links",  [])
+    groups = data.get("groups", [])
 
-    if not nodes:
+    if not isinstance(nodes, list) or not nodes:
         return None
+    if not isinstance(links,  list): links  = []
+    if not isinstance(groups, list): groups = []
 
     # ── Parse node rects ──────────────────────────────────────────────────────
     node_rects: dict[int, tuple] = {}
@@ -213,13 +220,24 @@ def render_detailed(json_path: Path) -> "Image.Image | None":
         pos = n.get("pos")
         if nid is None or not pos:
             continue
-        x, y = float(pos[0]), float(pos[1])
+        try:
+            if isinstance(pos, dict):
+                x, y = float(pos.get("0", 0)), float(pos.get("1", 0))
+            else:
+                x, y = float(pos[0]), float(pos[1])
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
         sz = n.get("size", {})
-        if isinstance(sz, dict):
-            w, h = float(sz.get("0", 200)), float(sz.get("1", 100))
-        elif isinstance(sz, (list, tuple)) and len(sz) >= 2:
-            w, h = float(sz[0]), float(sz[1])
-        else:
+        try:
+            if isinstance(sz, dict):
+                w = float(sz.get("0") or 200)
+                h = float(sz.get("1") or 100)
+            elif isinstance(sz, (list, tuple)) and len(sz) >= 2:
+                w = float(sz[0] if sz[0] is not None else 200)
+                h = float(sz[1] if sz[1] is not None else 100)
+            else:
+                w, h = 200.0, 100.0
+        except (TypeError, ValueError):
             w, h = 200.0, 100.0
         node_rects[nid] = (x, y, w, h)
 
@@ -410,7 +428,8 @@ def render_detailed(json_path: Path) -> "Image.Image | None":
             px, py = in_pos.get((nid, i), (0, 0))
             if px == 0 and py == 0:
                 continue
-            itype = (inp.get("type", "") if isinstance(inp, dict) else "").upper()
+            _iraw = inp.get("type", "") if isinstance(inp, dict) else ""
+            itype = (str(_iraw[0]) if isinstance(_iraw, list) else str(_iraw)).upper()
             iname =  inp.get("name", "")  if isinstance(inp, dict) else ""
             c = _SLOT_COLORS.get(itype, _DEFAULT_SLOT_COLOR)
             draw.ellipse([px-dr, py-dr, px+dr, py+dr], fill=c, outline=_lighten(c, 50), width=1)
@@ -421,7 +440,8 @@ def render_detailed(json_path: Path) -> "Image.Image | None":
             px, py = out_pos.get((nid, i), (0, 0))
             if px == 0 and py == 0:
                 continue
-            otype = (out.get("type", "") if isinstance(out, dict) else "").upper()
+            _oraw = out.get("type", "") if isinstance(out, dict) else ""
+            otype = (str(_oraw[0]) if isinstance(_oraw, list) else str(_oraw)).upper()
             oname =  out.get("name", "")  if isinstance(out, dict) else ""
             c = _SLOT_COLORS.get(otype, _DEFAULT_SLOT_COLOR)
             draw.ellipse([px-dr, py-dr, px+dr, py+dr], fill=c, outline=_lighten(c, 50), width=1)
