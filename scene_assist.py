@@ -20,10 +20,24 @@ from typing import List
 # Valid frame counts for LTX-Video: 8n+1  (temporal compression factor)
 VALID_FRAMES = [8 * n + 1 for n in range(3, 42)]   # 25 … 329
 
+# All resolutions are divisible by 32 on both axes (LTX-2.3 requirement).
+# 1280x720 / 848x480 / 720x1280 excluded — 720 and 848 are NOT divisible by 32.
+# Landscape resolutions — ordered high → low
 RESOLUTIONS = [
-    "1280x720", "1024x576", "1024x640", "960x544",
-    "848x480",  "832x480",  "768x512",  "704x480",
-    "720x1280", "576x1024", "544x960",  "480x832",  "512x704",
+    "1216x704",   # native ceiling (16:9-ish, max trained res — heavy on VRAM)
+    "1024x576",   # ★ safe sweet spot — 16:9, plenty of headroom
+    "1024x640",
+    "960x544",
+    "832x480",
+    "768x512",
+    "704x480",
+    # Portrait
+    "704x1216",   # native ceiling portrait
+    "576x1024",
+    "544x960",
+    "480x832",
+    "512x704",
+    # Square
     "640x640",
 ]
 
