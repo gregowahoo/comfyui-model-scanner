@@ -1,0 +1,12 @@
+{
+  "yamls": [
+    {
+      "path": "C:\\Comfy\\ComfyUI\\extra_model_paths.yaml",
+      "enabled": false
+    },
+    {
+      "path": "H:\\Comfy\\ComfyUI\\extra_model_paths.yaml",
+      "enabled": true
+    }
+  ]
+}
