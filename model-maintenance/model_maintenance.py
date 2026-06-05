@@ -316,6 +316,15 @@ def find_misplaced(models: list[ModelFile]) -> list[MisplacedModel]:
                     suggested, "High")
                 break
 
+        # Extension-based check (high confidence)
+        # GGUF/GGML are quantised formats loaded by UNETLoader — never CheckpointLoaderSimple
+        if not issue:
+            ext = Path(m.filename).suffix.lower()
+            if ext in (".gguf", ".ggml") and ft == "checkpoints":
+                issue = MisplacedModel(m,
+                    f"{ext} is a quantised format loaded by UNETLoader, not checkpoints/",
+                    "unet", "High")
+
         # Size check (medium confidence, only if no name hit)
         if not issue and ft in SIZE_RULES:
             lo, hi = SIZE_RULES[ft]
@@ -480,7 +489,8 @@ def _summary_bar(parent, text_var: tk.StringVar) -> tk.Label:
 
 
 def _ctx_menu(root: tk.Tk, tv: ttk.Treeview,
-              path_col_idx: int, status_var: tk.StringVar):
+              path_col_idx: int, status_var: tk.StringVar,
+              delete_cb=None):
     """Right-click context menu for any result treeview."""
     menu = tk.Menu(root, tearoff=0, bg="#1a1a3e", fg=FG,
                    activebackground="#3a3a7e", font=("Consolas",9))
@@ -510,6 +520,13 @@ def _ctx_menu(root: tk.Tk, tv: ttk.Treeview,
     menu.add_separator()
     menu.add_command(label="📁  Open in Explorer",command=open_folder)
 
+    if delete_cb:
+        menu.add_separator()
+        def do_delete():
+            p = _get_path()
+            if p: delete_cb(p, tv)
+        menu.add_command(label="🗑   Move to Recycle Bin", command=do_delete)
+
     tv.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
     tv.bind("<Double-1>", lambda _: open_folder())
 
@@ -532,6 +549,7 @@ class ModelMaintenance(tk.Tk):
         self._dupes_n:  list[list[ModelFile]] = []
         self._dupes_h:  list[list[ModelFile]] = []
         self._misplaced: list[MisplacedModel] = []
+        self._misplaced_paths: set[str]     = set()
         self._unused:   list[ModelFile]     = []
         self._wf_dirs:  list[str]           = []
         self._hash_done = False
@@ -698,8 +716,25 @@ class ModelMaintenance(tk.Tk):
     def _build_tab_inventory(self):
         tab = tk.Frame(self._nb, bg=BG); self._nb.add(tab, text="  📦 Inventory  ")
 
+        # Search bar
+        sb = tk.Frame(tab, bg=BG); sb.pack(fill="x", padx=8, pady=(6,2))
+        tk.Label(sb, text="🔍 Search name:", bg=BG, fg=FG2, font=("Consolas",9)).pack(side="left")
+        self._inv_search_var = tk.StringVar(value="")
+        self._inv_search_entry = tk.Entry(sb, textvariable=self._inv_search_var,
+                                          bg=PNL2, fg=FG, insertbackground=ACC,
+                                          font=("Consolas",10), relief="flat", bd=2,
+                                          highlightthickness=1, highlightbackground=DIM,
+                                          highlightcolor=ACC)
+        self._inv_search_entry.pack(side="left", padx=(6,4), fill="x", expand=True)
+        self._inv_search_var.trace_add("write", lambda *_: self._on_search_change())
+        tk.Button(sb, text="✕", command=lambda: self._inv_search_var.set(""),
+                  bg=PNL2, fg=FG2, font=("Consolas",9), relief="flat", bd=0,
+                  activebackground=PNL2, activeforeground=RED, cursor="hand2",
+                  padx=8).pack(side="left")
+        self._inv_search_after_id = None
+
         # Filter bar
-        fb = tk.Frame(tab, bg=BG); fb.pack(fill="x", padx=8, pady=(6,4))
+        fb = tk.Frame(tab, bg=BG); fb.pack(fill="x", padx=8, pady=(2,4))
         tk.Label(fb, text="Filter type:", bg=BG, fg=FG2, font=("Consolas",9)).pack(side="left")
         self._inv_type_var = tk.StringVar(value="All")
         self._inv_type_cb  = ttk.Combobox(fb, textvariable=self._inv_type_var,
@@ -747,7 +782,7 @@ class ModelMaintenance(tk.Tk):
         ]
         self._inv_tv, inv_f = _tree(tab, self._inv_all_cols)
         inv_f.pack(fill="both", expand=True, padx=8, pady=(0,0))
-        _ctx_menu(self, self._inv_tv, 5, self._status)
+        _ctx_menu(self, self._inv_tv, 5, self._status, delete_cb=self._delete_model_from)
         self._inv_vis = self._col_vis_load("inv", [c[0] for c in self._inv_all_cols])
         self._inv_tv["displaycolumns"] = [c[0] for c in self._inv_all_cols if c[0] in self._inv_vis]
         self._inv_tv.bind("<ButtonRelease-1>", lambda _: self._col_widths_save(self._inv_tv, "inv"))
@@ -761,11 +796,21 @@ class ModelMaintenance(tk.Tk):
         self._inv_size_lbl.configure(text="any" if v == 0 else f"≥ {v:.1f} GB")
         self._filter_inventory()
 
+    def _on_search_change(self):
+        """Debounce inventory search by 150ms so typing stays smooth."""
+        if self._inv_search_after_id is not None:
+            try: self.after_cancel(self._inv_search_after_id)
+            except Exception: pass
+        self._inv_search_after_id = self.after(150, self._filter_inventory)
+
     def _filter_inventory(self):
         ft = self._inv_type_var.get()
         fi = self._inv_inst_var.get()
         fd = self._inv_drive_var.get()
         min_bytes = int(self._inv_size_var.get() * GB)
+        query = self._inv_search_var.get().strip().lower()
+        # Space-separated terms must ALL match (AND search)
+        terms = [t for t in query.split() if t]
         self._inv_tv.delete(*self._inv_tv.get_children())
         shown, total_size = 0, 0
         for m in self._models:
@@ -773,11 +818,15 @@ class ModelMaintenance(tk.Tk):
             if fi != "All" and m.install_label != fi: continue
             if fd != "All" and Path(m.path).drive.upper() != fd.upper(): continue
             if min_bytes and m.size < min_bytes: continue
+            if terms:
+                fnl = m.filename.lower()
+                if not all(t in fnl for t in terms): continue
             self._inv_tv.insert("", "end", values=(
                 m.filename, m.folder_type, m.size_str,
                 m.mtime_str, m.install_label, m.path))
             shown += 1; total_size += m.size
-        self._inv_sum.set(f"  {shown:,} files    {_fmtsz(total_size)} total")
+        suffix = f"    (search: {query})" if query else ""
+        self._inv_sum.set(f"  {shown:,} files    {_fmtsz(total_size)} total{suffix}")
 
     # ── Tab: Duplicates ──────────────────────────────────────────────────
 
@@ -817,11 +866,12 @@ class ModelMaintenance(tk.Tk):
             ("path",     "Full Path",   500, "w"),
         ]
         self._dup_tv, dup_f = _tree(tab, self._dup_all_cols)
-        self._dup_tv.tag_configure("group", foreground=YEL, font=("Consolas",10,"bold"))
-        self._dup_tv.tag_configure("hash_group", foreground=RED, font=("Consolas",10,"bold"))
-        self._dup_tv.tag_configure("copy",  foreground=FG2)
+        self._dup_tv.tag_configure("group",     foreground=YEL, font=("Consolas",10,"bold"))
+        self._dup_tv.tag_configure("hash_group",foreground=RED, font=("Consolas",10,"bold"))
+        self._dup_tv.tag_configure("copy",      foreground=FG2)
+        self._dup_tv.tag_configure("wrong_loc", foreground="#ffaa44")
         dup_f.pack(fill="both", expand=True, padx=8)
-        _ctx_menu(self, self._dup_tv, 7, self._status)
+        _ctx_menu(self, self._dup_tv, 7, self._status, delete_cb=self._delete_model_from)
         self._dup_vis = self._col_vis_load("dup", [c[0] for c in self._dup_all_cols])
         self._dup_tv["displaycolumns"] = [c[0] for c in self._dup_all_cols if c[0] in self._dup_vis]
         self._dup_tv.bind("<ButtonRelease-1>", lambda _: self._col_widths_save(self._dup_tv, "dup"))
@@ -842,16 +892,30 @@ class ModelMaintenance(tk.Tk):
             total_wasted += wasted
             tag = "hash_group" if mode == "hash" else "group"
             indicator = "≡ HASH MATCH" if mode == "hash" else "⊕ SAME NAME"
+
+            # Detect mixed folder types within the group
+            folder_counts: dict[str, int] = {}
+            for m in grp:
+                folder_counts[m.folder_type] = folder_counts.get(m.folder_type, 0) + 1
+            mixed = len(folder_counts) > 1
+            # "majority" folder type — copies in other folder types are outliers
+            majority_ft = max(folder_counts, key=folder_counts.__getitem__)
+
+            mixed_badge = "  ⚠ mixed folders" if mixed else ""
             parent = tv.insert("", "end", values=(
-                f"{indicator}  {grp[0].filename}",
+                f"{indicator}  {grp[0].filename}{mixed_badge}",
                 len(grp), _fmtsz(wasted),
                 "", "", "", "", ""),
                 tags=(tag,), open=True)
             for m in grp:
+                wrong    = m.path in self._misplaced_paths
+                outlier  = mixed and m.folder_type != majority_ft
+                ftype    = f"⚠  {m.folder_type}" if (wrong or outlier) else m.folder_type
+                row_tags = ("copy", "wrong_loc") if (wrong or outlier) else ("copy",)
                 tv.insert(parent, "end", values=(
                     "", "", "", m.install_label,
-                    m.folder_type, m.size_str, m.mtime_str, m.path),
-                    tags=("copy",))
+                    ftype, m.size_str, m.mtime_str, m.path),
+                    tags=row_tags)
 
         label = "hash duplicates" if mode == "hash" else "filename duplicates"
         self._dup_sum.set(
@@ -887,7 +951,7 @@ class ModelMaintenance(tk.Tk):
         self._mis_tv.tag_configure("high",   foreground=RED)
         self._mis_tv.tag_configure("medium", foreground=YEL)
         mis_f.pack(fill="both", expand=True, padx=8)
-        _ctx_menu(self, self._mis_tv, 7, self._status)
+        _ctx_menu(self, self._mis_tv, 7, self._status, delete_cb=self._delete_model_from)
         self._mis_vis = self._col_vis_load("mis", [c[0] for c in self._mis_all_cols])
         self._mis_tv["displaycolumns"] = [c[0] for c in self._mis_all_cols if c[0] in self._mis_vis]
         self._mis_tv.bind("<ButtonRelease-1>", lambda _: self._col_widths_save(self._mis_tv, "mis"))
@@ -920,7 +984,7 @@ class ModelMaintenance(tk.Tk):
         ]
         self._unu_tv, unu_f = _tree(tab, self._unu_all_cols)
         unu_f.pack(fill="both", expand=True, padx=8)
-        _ctx_menu(self, self._unu_tv, 5, self._status)
+        _ctx_menu(self, self._unu_tv, 5, self._status, delete_cb=self._delete_model_from)
         self._unu_vis = self._col_vis_load("unu", [c[0] for c in self._unu_all_cols])
         self._unu_tv["displaycolumns"] = [c[0] for c in self._unu_all_cols if c[0] in self._unu_vis]
         self._unu_tv.bind("<ButtonRelease-1>", lambda _: self._col_widths_save(self._unu_tv, "unu"))
@@ -928,6 +992,62 @@ class ModelMaintenance(tk.Tk):
 
         self._unu_sum = tk.StringVar(value="")
         _summary_bar(tab, self._unu_sum)
+
+    # ── Delete / Recycle Bin ─────────────────────────────────────────────
+
+    @staticmethod
+    def _recycle_file(path: str) -> bool:
+        """Move a file to the Windows Recycle Bin via SHFileOperationW."""
+        try:
+            import ctypes
+            import ctypes.wintypes as W
+            class _SFOS(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd",        W.HWND),  ("wFunc",       W.UINT),
+                    ("pFrom",       ctypes.c_void_p), ("pTo", ctypes.c_void_p),
+                    ("fFlags",      W.WORD),  ("fAnyAborted", W.BOOL),
+                    ("hNameMappings", ctypes.c_void_p),
+                    ("lpTitle",     ctypes.c_void_p),
+                ]
+            buf = ctypes.create_unicode_buffer(path + "\0")   # double-null terminated
+            op  = _SFOS(wFunc=3,                              # FO_DELETE
+                        pFrom=ctypes.cast(buf, ctypes.c_void_p).value,
+                        fFlags=0x0040 | 0x0010 | 0x0004)      # ALLOWUNDO|NOCONFIRMATION|SILENT
+            ret = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op))
+            return ret == 0 and not op.fAnyAborted
+        except Exception:
+            return False
+
+    def _delete_model_from(self, path: str, tv: ttk.Treeview):
+        """Confirm then recycle the file; remove it from the treeview and model list."""
+        m = next((x for x in self._models if x.path == path), None)
+        size_str = m.size_str if m else ""
+        name     = Path(path).name
+
+        if not messagebox.askyesno(
+            "Move to Recycle Bin",
+            f"Move to Recycle Bin?\n\n{name}   {size_str}\n\n{path}",
+            icon="warning", default="no"
+        ):
+            return
+
+        if not self._recycle_file(path):
+            messagebox.showerror("Error", f"Could not move to Recycle Bin:\n{path}")
+            return
+
+        # Remove from internal model list and misplaced paths
+        self._models          = [x for x in self._models if x.path != path]
+        self._misplaced_paths.discard(path)
+
+        # Remove the selected row; in the duplicates tree also clean up parent if only 1 child left
+        for iid in tv.selection():
+            parent = tv.parent(iid)
+            tv.delete(iid)
+            if parent and len(tv.get_children(parent)) <= 1:
+                tv.delete(parent)   # no longer a duplicate group
+
+        self._status.set(f"🗑  Recycled: {name}")
+        self._update_tab_labels()
 
     # ── Column visibility & width persistence ────────────────────────────
 
@@ -1069,9 +1189,10 @@ class ModelMaintenance(tk.Tk):
 
     def _scan_done(self, models, dupes_n, misplaced, unused, wf_dirs):
         self._pb.stop(); self._pb.pack_forget()
-        self._models    = models
-        self._dupes_n   = dupes_n
-        self._misplaced = misplaced
+        self._models          = models
+        self._dupes_n         = dupes_n
+        self._misplaced       = misplaced
+        self._misplaced_paths = {mp.model.path for mp in misplaced}
         self._unused    = unused
         self._wf_dirs   = wf_dirs
 

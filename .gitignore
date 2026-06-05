@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 scanner.log
 *.log
+
+# Local app config (machine-specific paths, window state, etc.)
+comfy_model_scanner/scanner_config.json
+model_maintenance_config.json
